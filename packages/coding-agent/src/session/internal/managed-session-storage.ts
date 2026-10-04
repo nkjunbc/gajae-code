@@ -390,6 +390,15 @@ const replacementPublisherOwnerId = randomUUID();
 const activeReplacementAttempts = new Set<string>();
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/** Exact quarantine names used when native exact-unlink leaves a scrubbed lock inode. */
+export function isManagedLockQuarantineName(name: string): boolean {
+	const prefix = ".gjc-lock-";
+	const suffix = ".stale";
+	return (
+		name.startsWith(prefix) && name.endsWith(suffix) && UUID_PATTERN.test(name.slice(prefix.length, -suffix.length))
+	);
+}
+
 function replacementReceiptPublisher(bytes: Uint8Array): ReplacementReceiptPublisher | undefined {
 	let record: Record<string, unknown> | undefined;
 	try {
@@ -874,43 +883,24 @@ async function hashReaperFile(pathname: string, expected: fs.BigIntStats): Promi
 	}
 }
 
+interface ReaperParentIdentity {
+	readonly dev: bigint;
+	readonly ino: bigint;
+}
+
 function exactReaperUnlinkSync(
 	pathname: string,
 	stat: fs.BigIntStats,
 	sha256: string,
 	allowHardLink: boolean,
+	parentIdentity: ReaperParentIdentity,
 ): NativeExactUnlinkResult {
-	const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
-	if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
 	const identity: NativeExactFileIdentity = {
 		dev: stat.dev,
 		ino: stat.ino,
 		nlink: stat.nlink,
-		parentDev: parent.dev,
-		parentIno: parent.ino,
-		size: stat.size,
-		mtimeNs: stat.mtimeNs,
-		sha256,
-		quarantineName: remnantReapQuarantineName(pathname),
-		...(allowHardLink ? { allowHardLink: true, requireHardLink: true } : {}),
-	};
-	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
-}
-
-async function exactReaperUnlink(
-	pathname: string,
-	stat: fs.BigIntStats,
-	sha256: string,
-	allowHardLink: boolean,
-): Promise<NativeExactUnlinkResult> {
-	const parent = await fsp.lstat(path.dirname(pathname), { bigint: true });
-	if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
-	const identity: NativeExactFileIdentity = {
-		dev: stat.dev,
-		ino: stat.ino,
-		nlink: stat.nlink,
-		parentDev: parent.dev,
-		parentIno: parent.ino,
+		parentDev: parentIdentity.dev,
+		parentIno: parentIdentity.ino,
 		size: stat.size,
 		mtimeNs: stat.mtimeNs,
 		sha256,
@@ -957,6 +947,8 @@ export function reapScrubbedProtocolRemnantsSync(
 	const cutoff = Date.now() - minAgeMs;
 	let reaped = 0;
 	let failures = 0;
+	// Immutable expected identity only; native reopens and revalidates the parent per unlink.
+	let parentIdentity: ReaperParentIdentity | undefined;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
 		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
@@ -980,9 +972,29 @@ export function reapScrubbedProtocolRemnantsSync(
 			if (named.mtimeMs > cutoff) continue;
 			const sha256 = terminalRemnant ? EMPTY_FILE_SHA256 : hashReaperFileSync(pathname, named);
 			if (!sha256) continue;
-			const removed = exactReaperUnlinkSync(pathname, named, sha256, !terminalRemnant);
+			if (!parentIdentity) {
+				const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+				if (!parent.isDirectory() || parent.isSymbolicLink()) {
+					failures += 1;
+					continue;
+				}
+				parentIdentity = { dev: parent.dev, ino: parent.ino };
+			}
+			const removed = exactReaperUnlinkSync(pathname, named, sha256, !terminalRemnant, parentIdentity);
 			if (removed.ok) reaped += 1;
-			else if (!isBenignReaperRace(removed)) failures += 1;
+			else {
+				let parentKindMismatch = false;
+				if (removed.code === "reparse_point") {
+					try {
+						const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+						parentKindMismatch = !parent.isDirectory() || parent.isSymbolicLink();
+					} catch (error) {
+						// Preserve lookup-error accounting without changing or retrying the native result.
+						if (!isEnoent(error)) failures += 1;
+					}
+				}
+				if (parentKindMismatch || !isBenignReaperRace(removed)) failures += 1;
+			}
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
@@ -1016,6 +1028,7 @@ export async function reapScrubbedProtocolRemnants(
 	let reaped = 0;
 	let failures = 0;
 	let scanned = 0;
+	let parentIdentity: ReaperParentIdentity | undefined;
 	for (const name of names) {
 		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
 		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
@@ -1038,9 +1051,29 @@ export async function reapScrubbedProtocolRemnants(
 			if (named.mtimeMs > cutoff) continue;
 			const sha256 = terminalRemnant ? EMPTY_FILE_SHA256 : await hashReaperFile(pathname, named);
 			if (!sha256) continue;
-			const removed = await exactReaperUnlink(pathname, named, sha256, !terminalRemnant);
+			if (!parentIdentity) {
+				const parent = await fsp.lstat(path.dirname(pathname), { bigint: true });
+				if (!parent.isDirectory() || parent.isSymbolicLink()) {
+					failures += 1;
+					continue;
+				}
+				parentIdentity = { dev: parent.dev, ino: parent.ino };
+			}
+			const removed = await exactReaperUnlinkSync(pathname, named, sha256, !terminalRemnant, parentIdentity);
 			if (removed.ok) reaped += 1;
-			else if (!isBenignReaperRace(removed)) failures += 1;
+			else {
+				let parentKindMismatch = false;
+				if (removed.code === "reparse_point") {
+					try {
+						const parent = await fsp.lstat(path.dirname(pathname), { bigint: true });
+						parentKindMismatch = !parent.isDirectory() || parent.isSymbolicLink();
+					} catch (error) {
+						// Preserve lookup-error accounting without changing or retrying the native result.
+						if (!isEnoent(error)) failures += 1;
+					}
+				}
+				if (parentKindMismatch || !isBenignReaperRace(removed)) failures += 1;
+			}
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
@@ -1163,7 +1196,7 @@ type RetainedManagedReplacer = {
 		expectedSha256: string,
 	): { ok: boolean; code?: string };
 };
-type LockRecord = {
+export type LockRecord = {
 	attemptId: string;
 	pid: number;
 	bootId?: string;
@@ -1457,6 +1490,7 @@ export class ManagedSessionDescendantStore {
 	readonly #root: ManagedDirectoryRoot;
 	readonly #baseDir: string;
 	readonly #policy: ManagedSessionSecurityPolicy;
+	readonly #access: "read-only" | "read-write";
 	readonly #authority: RecoveryFsRoot | undefined;
 	#ownsAuthority = false;
 	#closed = false;
@@ -1475,12 +1509,18 @@ export class ManagedSessionDescendantStore {
 		policy?: ManagedSessionSecurityPolicy,
 		profileAgentDir?: string,
 		expectedSubtreeRoot?: ManagedDirectoryRoot,
+		access: "read-only" | "read-write" = "read-write",
 	) {
+		if (access !== "read-only" && access !== "read-write") throw new Error("managed_store_access_invalid");
+		if (access === "read-only" && retained) throw new Error("managed_read_store_cannot_borrow_authority");
+		if (access === "read-only" && !expectedSubtreeRoot)
+			throw new Error("managed_read_store_requires_existing_identity");
 		managedRelativePath(root, baseDir);
 
 		this.#root = root;
 		this.#baseDir = path.resolve(baseDir);
 		this.#policy = policy ?? "default";
+		this.#access = access;
 		this.#profileAgentDir = profileAgentDir ?? root.canonicalPath;
 		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
 		if (retained) {
@@ -1558,7 +1598,7 @@ export class ManagedSessionDescendantStore {
 			dev: canonicalFileId(subtreeStat.dev),
 			ino: canonicalFileId(subtreeStat.ino),
 		});
-		if (process.platform === "linux") {
+		if (process.platform === "linux" && access === "read-write") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
 			const authority = nativeSessionStorage().openRecoveryFsRoot(this.#baseDir);
 			const retained = authority.identity();
@@ -1619,6 +1659,7 @@ export class ManagedSessionDescendantStore {
 	}
 
 	retainAuthority(): RecoveryFsRoot | undefined {
+		this.#assertWritable();
 		if (!this.#authority) return undefined;
 		return this.#authority.retainManagedDirectory(
 			"",
@@ -1673,7 +1714,7 @@ export class ManagedSessionDescendantStore {
 	captureDirectoryIdentity(relativePath: string): { dev: string; ino: string } {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
-		if (!this.#authority) this.#assertPathBackedDirectoryChain(resolved);
+		if (this.#access === "read-only" || !this.#authority) this.#assertPathBackedDirectoryChain(resolved);
 		const named = fs.lstatSync(resolved, { bigint: true });
 		if (!named.isDirectory() || named.isSymbolicLink()) throw new Error("managed_directory_identity_unavailable");
 		const dev = canonicalFileId(named.dev);
@@ -2019,7 +2060,12 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
+	#assertWritable(): void {
+		if (this.#access === "read-only") throw new Error("managed_store_read_only");
+	}
+
 	#beforeMutation(): void {
+		this.#assertWritable();
 		this.#assertBound();
 		// Reaping is scheduled BEFORE reconciliation, not after. The receipt scan
 		// throws `managed_replace_cleanup_receipt_limit_exceeded` once the bound
@@ -3028,6 +3074,7 @@ export class ManagedSessionDescendantStore {
 			sourceStoreRelativePath: string;
 		},
 	): ManagedFileSnapshot {
+		this.#assertWritable();
 		this.#assertBound();
 		const sourceResolved = this.#resolve(sourceRelativePath);
 		const destinationResolved = this.#resolve(destinationRelativePath);
@@ -3297,7 +3344,7 @@ function sameReplacementIdentity(
 	);
 }
 
-function parseLockBytes(bytes: Uint8Array): LockRecord | undefined {
+export function parseManagedLockRecord(bytes: Uint8Array): LockRecord | undefined {
 	try {
 		const value: unknown = JSON.parse(Buffer.from(bytes).toString("utf8"));
 		if (!value || typeof value !== "object") return undefined;
@@ -3320,7 +3367,7 @@ function parseLock(pathname: string): LockRecord | undefined {
 	try {
 		const stat = fs.lstatSync(pathname);
 		if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
-		return parseLockBytes(fs.readFileSync(pathname));
+		return parseManagedLockRecord(fs.readFileSync(pathname));
 	} catch {
 		return undefined;
 	}
@@ -3329,7 +3376,7 @@ function parseLock(pathname: string): LockRecord | undefined {
 function captureLock(pathname: string): { record: LockRecord; snapshot: ManagedFileSnapshot } | undefined {
 	try {
 		const snapshot = captureManagedFileNoFollow(pathname);
-		const record = parseLockBytes(snapshot.bytes);
+		const record = parseManagedLockRecord(snapshot.bytes);
 		return record ? { record, snapshot } : undefined;
 	} catch {
 		return undefined;

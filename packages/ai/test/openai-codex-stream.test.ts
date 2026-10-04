@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import { enrichModelThinking } from "@gajae-code/ai/model-thinking";
 import {
 	createCodexStreamProgressClassifier,
@@ -8,7 +9,7 @@ import {
 	streamOpenAICodexResponses,
 } from "@gajae-code/ai/providers/openai-codex-responses";
 import type { Context, Model, ProviderSessionState } from "@gajae-code/ai/types";
-import { getAgentDir, setAgentDir, TempDir } from "@gajae-code/utils";
+import { getAgentDir, logger, setAgentDir, TempDir } from "@gajae-code/utils";
 import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
 
 const RAW_SENTINEL = "RAW_SENTINEL_DO_NOT_SURFACE";
@@ -517,6 +518,7 @@ describe("openai-codex streaming", () => {
 	});
 
 	it("salvages finalized function calls after a transient stream close", async () => {
+		const warn = vi.spyOn(logger, "warn");
 		const sse = createCodexErrorSse([
 			{
 				type: "response.output_item.added",
@@ -555,6 +557,119 @@ describe("openai-codex streaming", () => {
 		expect(result.content).toEqual([
 			{ type: "toolCall", id: "call_1|fc_1", name: "todo_write", arguments: { ops: [] } },
 		]);
+		expect(warn).not.toHaveBeenCalledWith("[codex] codex stream close salvage refused", expect.anything());
+	});
+
+	it("warns with bounded diagnostics when transient-close salvage is refused", async () => {
+		const warn = vi.spyOn(logger, "warn");
+		const sse = createCodexErrorSse([
+			...Array.from({ length: 20 }, (_, index) => ({
+				type: "diagnostic.replay",
+				output_index: index,
+				content: RAW_SENTINEL,
+				arguments: RAW_SENTINEL,
+				encrypted_content: RAW_SENTINEL,
+				headers: { authorization: RAW_SENTINEL },
+			})),
+			{
+				type: "response.output_item.added",
+				output_index: 2,
+				item: {
+					type: "function_call",
+					id: "fc_partial",
+					call_id: "call_partial",
+					name: "todo_write",
+					arguments: "",
+				},
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_partial", delta: '{"ops":' },
+			{
+				type: "error",
+				code: "request_timeout",
+				message:
+					"stream disconnected before completion: stream closed before response.completed (code=request_timeout)",
+			},
+		]);
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), disableProviderRetries: true },
+		).result();
+
+		const refusal = warn.mock.calls.find(([message]) => message === "[codex] codex stream close salvage refused");
+		expect(result.stopReason).toBe("error");
+		expect(refusal).toBeDefined();
+		expect(refusal?.[1]).toMatchObject({
+			canSalvageFinalizedCall: false,
+			canSalvageCompleteArguments: false,
+			finalizedToolCallIds: 0,
+			contentBlockTypes: ["toolCall"],
+			errorCode: "request_timeout",
+			recentEvents: [
+				...Array.from({ length: 13 }, (_, index) => ({
+					type: "diagnostic.replay",
+					itemType: null,
+					itemId: null,
+					outputIndex: index + 7,
+					deltaLength: 0,
+				})),
+				{
+					type: "response.output_item.added",
+					itemType: "function_call",
+					itemId: "fc_partial",
+					outputIndex: 2,
+					deltaLength: 0,
+				},
+				{
+					type: "response.function_call_arguments.delta",
+					itemType: null,
+					itemId: "fc_partial",
+					outputIndex: null,
+					deltaLength: 7,
+				},
+				{ type: "error", itemType: null, itemId: null, outputIndex: null, deltaLength: 0 },
+			],
+		});
+		expect(JSON.stringify(refusal)).not.toContain(RAW_SENTINEL);
+		expect(JSON.stringify(refusal)).not.toContain('{"ops":');
+		expect(
+			warn.mock.calls.filter(([message]) => message === "[codex] codex stream close salvage refused"),
+		).toHaveLength(1);
+	});
+
+	it("keeps salvage refusal debug-only for non-transient stream errors", async () => {
+		const warn = vi.spyOn(logger, "warn");
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_invalid",
+					call_id: "call_invalid",
+					name: "todo_write",
+					arguments: "",
+				},
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_invalid", delta: '{"ops":' },
+			{ type: "error", code: "invalid_request_error", message: "invalid request" },
+		]);
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), disableProviderRetries: true },
+		).result();
+
+		expect(
+			warn.mock.calls.filter(([message]) => message === "[codex] codex stream close salvage refused"),
+		).toHaveLength(0);
 	});
 
 	it.each([
@@ -3235,6 +3350,50 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("transient failure");
+	});
+
+	it("retries a connection-refused Codex SSE open before completing the turn", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-connect-retry-");
+		setAgentDir(tempDir.path());
+		const sse = createCompletedCodexSse("Recovered");
+		let attempts = 0;
+		const fetchMock = vi.fn(async () => {
+			attempts += 1;
+			if (attempts === 1) {
+				throw Object.assign(new Error("connection refused"), { code: "ConnectionRefused" });
+			}
+			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(result.stopReason).not.toBe("error");
+	});
+
+	it("backs off connection-refused SSE opens for at least ten seconds", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-connect-backoff-");
+		setAgentDir(tempDir.path());
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const fetchMock = vi.fn(async () => {
+			throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(fetchMock).toHaveBeenCalledTimes(6);
+		expect(waitSpy.mock.calls.reduce((total, [delay]) => total + Number(delay), 0)).toBeGreaterThanOrEqual(10_000);
 	});
 
 	it("retries transient model_error SSE events before surfacing an error", async () => {
