@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { markNonDispatchedToolEvent } from "@gajae-code/agent-core";
+import { markNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
+import { createTestSession } from "../../../test/utilities";
 import { AsyncJobManager } from "../../async";
 import type { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../../extensibility/extensions";
@@ -103,7 +104,46 @@ test("runtime capabilities preserve explicit primary control surface", () => {
 	expect(createSdkCapabilities(policy, false, "cli")).toMatchObject({ primaryControlSurface: "cli" });
 });
 
-function memoryTransport(): SessionSdkTransport & {
+test("thinking.set uses the control setter and reports the applied session level", async () => {
+	const sessionContext = await createTestSession({ inMemory: true });
+	const { session, tempDir: cwd, cleanup } = sessionContext;
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+		sendUserMessage: async () => {},
+		setThinkingLevel: () => {
+			throw new Error("thinking.set must not use the legacy setter");
+		},
+		setThinkingLevelForControl: async (level: ThinkingLevel, persist: boolean) => {
+			expect(persist).toBe(false);
+			await session.setThinkingLevelForControl(level, persist);
+		},
+	} as unknown as ExtensionAPI;
+	const response = Promise.withResolvers<SdkFrame>();
+	const transport = memoryTransport(frame => {
+		if (frame.type === "control_response" && frame.id === "thinking-set") response.resolve(frame);
+	});
+	createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+	const ctx = extensionContext(transport.sessionId, cwd);
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		transport.feed("client", {
+			type: "control_request",
+			id: "thinking-set",
+			operation: "thinking.set",
+			input: { level: ThinkingLevel.Medium },
+		} as SdkFrame);
+		await response.promise;
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Medium);
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+		await cleanup();
+	}
+});
+
+function memoryTransport(onSend?: (frame: SdkFrame) => void): SessionSdkTransport & {
 	feed(connectionId: string, frame: SdkFrame): void;
 	readonly sent: SdkFrame[];
 	readonly broadcasts: SdkFrame[];
@@ -126,6 +166,7 @@ function memoryTransport(): SessionSdkTransport & {
 		},
 		sendFrame(_connectionId, frame) {
 			sent.push(frame);
+			onSend?.(frame);
 		},
 		start: async () => {
 			started = true;
@@ -290,7 +331,7 @@ test("session.last_assistant returns the latest projected readable text past non
 	});
 });
 
-test("session.last_assistant returns resource_gone when the projected transcript has no readable assistant text", async () => {
+test("session.last_assistant returns null when the projected transcript has no readable assistant text", async () => {
 	const sessionId = "last-assistant-empty";
 	const ctx = extensionContext(sessionId, "/tmp", {
 		transcript: [
@@ -311,7 +352,7 @@ test("session.last_assistant returns resource_gone when the projected transcript
 		],
 	});
 
-	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: true, page: { items: [null] } });
 });
 
 test("native prompt reconciliation fails closed for an explicitly empty assistant result", () => {
@@ -4142,6 +4183,7 @@ describe("SessionSdkSessionRuntime", () => {
 interface PreflightHooks {
 	onPreflightAccepted?: () => void;
 	onPreflightAcceptCommit?: () => void | Promise<void>;
+	expectedSdkRunToken?: string;
 }
 
 interface ResponseFrame {
@@ -4481,6 +4523,43 @@ async function settledStatus(
 function neverSettlingPromise(): Promise<void> {
 	return Promise.withResolvers<void>().promise;
 }
+
+test("SDK turn.steer preserves its expected run token and propagates a stale-run rejection", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-turn-steer-run-token-"));
+	const staleToken = "ended-command:ended-turn";
+	const clientRef = "stale-steer-ref";
+	const calls: Array<{ content: unknown; deliverAs?: string; expectedSdkRunToken?: string }> = [];
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("steer-run-token", cwd, {
+			sendUserMessage: async (content, options) => {
+				calls.push({
+					content,
+					deliverAs: options?.deliverAs,
+					expectedSdkRunToken: options?.expectedSdkRunToken,
+				});
+				if (options?.expectedSdkRunToken === staleToken)
+					throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
+				return "completed";
+			},
+		});
+
+		const rejected = await harness.control("turn.steer", {
+			text: "stale steer",
+			expectedSdkRunToken: staleToken,
+			clientRef,
+		});
+		expect(rejected).toMatchObject({ ok: false, error: { code: "turn_not_active" } });
+		expect(calls).toEqual([{ content: "stale steer", deliverAs: "steer", expectedSdkRunToken: staleToken }]);
+		expect(await harness.query("turn.steer_status", { clientRef })).toMatchObject({
+			ok: true,
+			result: { status: "rejected" },
+		});
+	} finally {
+		if (harness) await harness.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 
 describe("post-acceptance invocation terminalization", () => {
 	test.each([
