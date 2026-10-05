@@ -5435,7 +5435,10 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(correlation.turnId).toBeDefined();
 			const terminal = await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation });
 			expect(terminal).toMatchObject(correlation);
-			expect(harness.broadcasts.filter(frame => frame.kind === "agent_start")).toHaveLength(2);
+			// Wait for session to settle and ensure no further continuations are queued
+			await session?.waitForIdle();
+			const agentStarts = harness.broadcasts.filter(frame => frame.kind === "agent_start");
+			expect(agentStarts).toHaveLength(2);
 			const ends = harness.broadcasts.filter(frame => frame.kind === "agent_end");
 			expect(ends).toHaveLength(1);
 			expect(ends[0]).toMatchObject({ payload: correlation });
