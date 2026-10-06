@@ -279,6 +279,7 @@ import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool, CustomToolContext } from "../extensibility/custom-tools/types";
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import type {
+	AgentFailedEvent,
 	ExtensionCommandContext,
 	ExtensionRunner,
 	ExtensionUIContext,
@@ -298,7 +299,7 @@ import type {
 	TreePreparation,
 	TurnEndEvent,
 	TurnStartEvent,
-} from "../extensibility/extensions";
+	} from "../extensibility/extensions";
 import {
 	type CompactOptions,
 	type ContextUsage,
@@ -9920,16 +9921,13 @@ export class AgentSession {
 			} else if (event.type === "agent_failed") {
 				// Capture the original error diagnostic before sanitization
 				const originalDiagnostic = failureCauseDiagnostic(event.error);
-				const emittedEvent: any = {
+				const emittedEvent: AgentFailedEvent = {
 					type: "agent_failed",
 					error: sanitizePromptFailure(event.error),
 					scope: event.scope,
 					...(sdkRunToken ? { sdkRunToken } : {}),
+					...(isValidFailureCauseDiagnostic(originalDiagnostic) ? { failureCauseDiagnostic: originalDiagnostic } : {}),
 				};
-				// Add the original error diagnostic if valid
-				if (isValidFailureCauseDiagnostic(originalDiagnostic)) {
-					emittedEvent.failureCauseDiagnostic = originalDiagnostic;
-				}
 				await this.#extensionRunner.emit(emittedEvent, undefined, deliveryScope);
 			} else if (event.type === "agent_end") {
 				const extensionEvent = {
